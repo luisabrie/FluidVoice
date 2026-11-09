@@ -11,6 +11,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let selectedProviderID: String
     let selectedModelByProvider: [String: String]
     let savedProviders: [SettingsStore.SavedProvider]
+    /// Optional so backups from before Amazon Bedrock decode.
+    var bedrockRegion: String? = nil
     let modelReasoningConfigs: [String: SettingsStore.ModelReasoningConfig]
     let privateAIPrefixKVCacheEnabled: Bool?
     let privateAIBoostEnabled: Bool?

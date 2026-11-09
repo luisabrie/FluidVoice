@@ -49,6 +49,13 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
     @Published var providerAPIKeys: [String: String] = [:]
     @Published var currentProvider: String = ""
     @Published var savedProviders: [SettingsStore.SavedProvider] = []
+
+    // Amazon Bedrock
+    @Published var bedrockRegion: String = AmazonBedrock.defaultRegion
+    @Published var awsProfiles: [AWSConfigProfiles.Profile] = []
+    @Published var awsSignIn: AWSSignInState = .idle
+    var awsProfilesTask: Task<Void, Never>?
+    var awsSignInTask: Task<Void, Never>?
     private var persistsSelectedProvider = true
     private var managedOriginalKey: String?
     @Published var selectedProviderID: String {
@@ -168,6 +175,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         self.selectedModelByProvider = self.settings.selectedModelByProvider
         self.providerAPIKeys = self.settings.providerAPIKeys
         self.savedProviders = self.settings.savedProviders
+        self.bedrockRegion = self.settings.bedrockRegion
         self.dictationPromptProfiles = self.settings.dictationPromptProfiles
         self.appPromptBindings = self.settings.appPromptBindings
         self.selectedDictationPromptID = self.settings.selectedDictationPromptID
@@ -285,6 +293,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         case "": return "No Provider"
         case "openai": return "OpenAI"
         case "groq": return "Groq"
+        case AmazonBedrock.providerID: return AmazonBedrock.displayName
         default:
             return self.savedProviders.first(where: { $0.id == providerID })?.name ?? providerID.capitalized
         }
@@ -594,6 +603,24 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         }
     }
 
+    /// Bedrock is built in, so a region change replaces its endpoint and needs a new verification.
+    /// Its inference profile IDs carry the region's geography (`us.`, `eu.`), so they move with it.
+    func updateBedrockRegion(_ region: String) {
+        guard let normalized = AmazonBedrock.normalizedRegion(region), normalized != self.settings.bedrockRegion else { return }
+        self.settings.bedrockRegion = normalized
+        self.bedrockRegion = normalized
+
+        let providerID = AmazonBedrock.providerID
+        if providerID == self.selectedProviderID {
+            self.openAIBaseURL = ModelRepository.shared.defaultBaseURL(for: providerID)
+            self.updateCurrentProvider()
+        }
+        self.invalidateVerification(for: providerID)
+        self.saveSavedProviders()
+        // Each region offers its own inference profiles; fetching keeps the selected model under one of them.
+        Task { await self.fetchModels(for: providerID) }
+    }
+
     func updateCurrentProvider() {
         let url = self.openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if url.contains("openai.com") { self.currentProvider = "openai"; return }
@@ -815,6 +842,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         }
         let apiKey = self.providerAPIKey(for: providerID)
         let isLocal = self.isLocalEndpoint(baseURL)
+        let isBedrock = AmazonBedrock.isConverseEndpoint(baseURL: baseURL)
         let isAnthropic = providerID == "anthropic" || baseURL.contains("anthropic.com")
 
         // Validate inputs with specific error messages
@@ -826,10 +854,15 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
             return
         }
 
-        if !isLocal, apiKey.isEmpty {
+        if !isLocal, isBedrock ? !BedrockCredential(storedValue: apiKey).isComplete : apiKey.isEmpty {
             await MainActor.run {
                 self.updateConnectionStatus(.failed, for: providerID)
-                self.setConnectionError("API key is required for \(providerName). Enter your API key above.", for: providerID)
+                self.setConnectionError(
+                    isBedrock
+                        ? "Choose an AWS profile or enter a Bedrock API key for \(providerName)."
+                        : "API key is required for \(providerName). Enter your API key above.",
+                    for: providerID
+                )
             }
             return
         }
@@ -855,117 +888,153 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         // Every validation/network exit must stop the spinner.
         defer { self.isTestingConnection = false }
 
-        // Build the endpoint URL
-        let endpoint = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fullURL: String
-
-        if isAnthropic, !usesResponsesAPI {
-            // Anthropic uses /messages endpoint, not /chat/completions
-            if endpoint.contains("/messages") {
-                fullURL = endpoint
-            } else {
-                fullURL = endpoint + "/messages"
-            }
-        } else {
-            fullURL = LLMClient.endpoint(for: endpoint, useResponsesAPI: usesResponsesAPI)
-        }
-
-        // Debug logging
-        DebugLogger.shared.debug(
-            "testAPIConnection: provider=\(providerID), model=\(trimmedModel), baseURL=\(endpoint), fullURL=\(fullURL), isAnthropic=\(isAnthropic), usesResponsesAPI=\(usesResponsesAPI)",
-            source: "AISettingsView"
-        )
-
-        guard let url = URL(string: fullURL) else {
-            await MainActor.run {
-                self.updateConnectionStatus(.failed, for: providerID)
-                self.setConnectionError("Invalid Base URL format: '\(endpoint)' could not be parsed as a URL", for: providerID)
-            }
-            return
-        }
-
-        // Build the request based on provider type
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 15
-
-        // Set authorization header (different for Anthropic)
-        if !apiKey.isEmpty {
-            if isAnthropic {
-                request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-            } else {
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            }
-        }
-
-        // Build request body (different format for Anthropic)
-        let requestDict: [String: Any]
         let provKey = self.providerKey(for: providerID)
         let reasoningConfig = self.settings.getReasoningConfig(forModel: trimmedModel, provider: provKey)
 
-        if usesResponsesAPI {
-            var dict: [String: Any] = [
-                "model": trimmedModel,
-                "input": "test",
-                "store": false,
-                "max_output_tokens": 50,
-            ]
-
+        // Bedrock verifies the exact request LLMClient sends, including its SigV4 signature.
+        let verificationRequest: URLRequest
+        if isBedrock {
+            var extraParameters: [String: Any] = [:]
             if let config = reasoningConfig, config.isEnabled {
-                if config.parameterName == "reasoning_effort" {
-                    dict["reasoning"] = ["effort": config.parameterValue]
-                } else if config.parameterName == "enable_thinking" {
-                    dict[config.parameterName] = config.parameterValue == "true"
-                } else {
-                    dict[config.parameterName] = config.parameterValue
-                }
+                extraParameters[config.parameterName] = config.parameterName == "enable_thinking"
+                    ? (config.parameterValue == "true")
+                    : config.parameterValue
             }
-            requestDict = dict
-        } else if isAnthropic {
-            // Anthropic API format
-            requestDict = [
-                "model": trimmedModel,
-                "max_tokens": 10,
-                "messages": [["role": "user", "content": "Hi"]],
-            ]
-        } else {
-            // OpenAI-compatible format
-            var dict: [String: Any] = [
-                "model": trimmedModel,
-                "messages": [["role": "user", "content": "test"]],
-            ]
-
-            let usesMaxCompletionTokens = self.settings.isReasoningModel(trimmedModel)
-            if usesMaxCompletionTokens {
-                dict["max_completion_tokens"] = 50
-            } else {
-                dict["max_tokens"] = 50
-            }
-
-            if let config = reasoningConfig, config.isEnabled {
-                if config.parameterName == "enable_thinking" {
-                    dict[config.parameterName] = config.parameterValue == "true"
-                } else {
-                    dict[config.parameterName] = config.parameterValue
-                }
-            }
-            requestDict = dict
-        }
-
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: requestDict, options: []) else {
-            await MainActor.run {
+            do {
+                var request = try await LLMClient.shared.prepareRequest(LLMClient.Config(
+                    messages: [["role": "user", "content": "Hi"]],
+                    model: trimmedModel,
+                    baseURL: baseURL,
+                    apiKey: apiKey,
+                    streaming: false,
+                    maxTokens: 50,
+                    extraParameters: extraParameters
+                ))
+                request.timeoutInterval = 15
+                verificationRequest = request
+            } catch {
+                DebugLogger.shared.error(
+                    "testAPIConnection: could not prepare the Bedrock request for \(providerID): \(error.localizedDescription)",
+                    source: "AISettingsView"
+                )
+                guard verificationIdentity == self.modelVerificationIdentity(for: providerID) else { return }
+                self.modelVerifications.remove(verificationIdentity)
                 self.updateConnectionStatus(.failed, for: providerID)
-                self.setConnectionError("Internal error: Failed to create test request payload", for: providerID)
+                self.setConnectionError(error.localizedDescription, for: providerID)
+                return
             }
-            return
+        } else {
+            // Build the endpoint URL
+            let endpoint = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fullURL: String
+
+            if isAnthropic, !usesResponsesAPI {
+                // Anthropic uses /messages endpoint, not /chat/completions
+                if endpoint.contains("/messages") {
+                    fullURL = endpoint
+                } else {
+                    fullURL = endpoint + "/messages"
+                }
+            } else {
+                fullURL = LLMClient.endpoint(for: endpoint, useResponsesAPI: usesResponsesAPI)
+            }
+
+            // Debug logging
+            DebugLogger.shared.debug(
+                "testAPIConnection: provider=\(providerID), model=\(trimmedModel), baseURL=\(endpoint), fullURL=\(fullURL), isAnthropic=\(isAnthropic), usesResponsesAPI=\(usesResponsesAPI)",
+                source: "AISettingsView"
+            )
+
+            guard let url = URL(string: fullURL) else {
+                await MainActor.run {
+                    self.updateConnectionStatus(.failed, for: providerID)
+                    self.setConnectionError("Invalid Base URL format: '\(endpoint)' could not be parsed as a URL", for: providerID)
+                }
+                return
+            }
+
+            // Build the request based on provider type
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 15
+
+            // Set authorization header (different for Anthropic)
+            if !apiKey.isEmpty {
+                if isAnthropic {
+                    request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                    request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                } else {
+                    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                }
+            }
+
+            // Build request body (different format for Anthropic)
+            let requestDict: [String: Any]
+
+            if usesResponsesAPI {
+                var dict: [String: Any] = [
+                    "model": trimmedModel,
+                    "input": "test",
+                    "store": false,
+                    "max_output_tokens": 50,
+                ]
+
+                if let config = reasoningConfig, config.isEnabled {
+                    if config.parameterName == "reasoning_effort" {
+                        dict["reasoning"] = ["effort": config.parameterValue]
+                    } else if config.parameterName == "enable_thinking" {
+                        dict[config.parameterName] = config.parameterValue == "true"
+                    } else {
+                        dict[config.parameterName] = config.parameterValue
+                    }
+                }
+                requestDict = dict
+            } else if isAnthropic {
+                // Anthropic API format
+                requestDict = [
+                    "model": trimmedModel,
+                    "max_tokens": 10,
+                    "messages": [["role": "user", "content": "Hi"]],
+                ]
+            } else {
+                // OpenAI-compatible format
+                var dict: [String: Any] = [
+                    "model": trimmedModel,
+                    "messages": [["role": "user", "content": "test"]],
+                ]
+
+                let usesMaxCompletionTokens = self.settings.isReasoningModel(trimmedModel)
+                if usesMaxCompletionTokens {
+                    dict["max_completion_tokens"] = 50
+                } else {
+                    dict["max_tokens"] = 50
+                }
+
+                if let config = reasoningConfig, config.isEnabled {
+                    if config.parameterName == "enable_thinking" {
+                        dict[config.parameterName] = config.parameterValue == "true"
+                    } else {
+                        dict[config.parameterName] = config.parameterValue
+                    }
+                }
+                requestDict = dict
+            }
+
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: requestDict, options: []) else {
+                await MainActor.run {
+                    self.updateConnectionStatus(.failed, for: providerID)
+                    self.setConnectionError("Internal error: Failed to create test request payload", for: providerID)
+                }
+                return
+            }
+            request.httpBody = jsonData
+            verificationRequest = request
         }
-        request.httpBody = jsonData
 
         // Make the request
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: verificationRequest)
             // A late result must never label a different model or changed credentials.
             guard verificationIdentity == self.modelVerificationIdentity(for: providerID) else { return }
 
@@ -1151,6 +1220,9 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         guard self.saveProviderAPIKeys(invalidating: self.selectedProviderID) else {
             self.providerAPIKeys = previousAPIKeys
             return false
+        }
+        if self.selectedProviderID == AmazonBedrock.providerID, let region = AmazonBedrock.region(fromBaseURL: self.editProviderBaseURL) {
+            self.updateBedrockRegion(region)
         }
         return true
     }
@@ -1385,6 +1457,8 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
             )
 
             await MainActor.run {
+                // A newer fetch owns the list once the provider's URL changes (a Bedrock region switch, say).
+                guard baseURL == self.providerBaseURL(for: providerID) else { return }
                 guard !models.isEmpty else {
                     self.fetchModelsError = "No models returned from API"
                     return
@@ -1397,13 +1471,13 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
                 if providerID == self.selectedProviderID {
                     self.availableModels = models
                     if !models.contains(self.selectedModel) {
-                        self.selectedModel = models.first ?? ""
+                        self.selectedModel = self.replacementModel(for: self.selectedModel, among: models, providerID: providerID)
                     }
                 }
 
                 let selectedForProvider = self.selectedModelByProvider[key] ?? ""
-                if !models.contains(selectedForProvider), let first = models.first {
-                    self.selectedModelByProvider[key] = first
+                if !models.contains(selectedForProvider), !models.isEmpty {
+                    self.selectedModelByProvider[key] = self.replacementModel(for: selectedForProvider, among: models, providerID: providerID)
                     self.settings.selectedModelByProvider = self.selectedModelByProvider
                 }
 
@@ -1423,6 +1497,15 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
                 self.fetchModelsError = error.localizedDescription
             }
         }
+    }
+
+    /// The model to select when the current one isn't in a provider's new list. Bedrock keeps the same model under an
+    /// inference profile the new region offers.
+    private func replacementModel(for current: String, among models: [String], providerID: String) -> String {
+        if providerID == AmazonBedrock.providerID, let match = ModelRepository.bedrockModelID(current, among: models) {
+            return match
+        }
+        return models.first ?? ""
     }
 
     private func providerBaseURL(for providerID: String) -> String {

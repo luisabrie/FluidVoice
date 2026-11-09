@@ -89,6 +89,30 @@ final class SettingsBackupRoundTripTests: XCTestCase {
         }
     }
 
+    func testBedrockRegionRoundTripsAndOlderBackupsKeepIt() throws {
+        try self.withSavedDefaults {
+            let settings = SettingsStore.shared
+            settings.bedrockRegion = "eu-west-1"
+            let encoded = try JSONEncoder().encode(settings.makeBackupPayload())
+
+            settings.bedrockRegion = "us-east-1"
+            try settings.restore(
+                from: JSONDecoder().decode(SettingsBackupPayload.self, from: encoded),
+                promptProfiles: settings.dictationPromptProfiles,
+                appPromptBindings: []
+            )
+            XCTAssertEqual(settings.bedrockRegion, "eu-west-1")
+
+            settings.bedrockRegion = "ap-northeast-1"
+            settings.restore(
+                from: try self.payload(removing: ["bedrockRegion"]),
+                promptProfiles: settings.dictationPromptProfiles,
+                appPromptBindings: []
+            )
+            XCTAssertEqual(settings.bedrockRegion, "ap-northeast-1")
+        }
+    }
+
     func testExplicitEmptyPromptConfigurationsClearPreviousMappings() throws {
         try self.withSavedDefaults {
             let settings = SettingsStore.shared

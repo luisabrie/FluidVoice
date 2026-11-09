@@ -3730,6 +3730,7 @@ final class SettingsStore: ObservableObject {
             selectedProviderID: self.selectedProviderID,
             selectedModelByProvider: self.selectedModelByProvider,
             savedProviders: self.savedProviders,
+            bedrockRegion: self.bedrockRegion,
             modelReasoningConfigs: self.modelReasoningConfigs,
             privateAIPrefixKVCacheEnabled: self.privateAIPrefixKVCacheEnabled,
             privateAIBoostEnabled: self.privateAIBoostEnabled,
@@ -3863,6 +3864,9 @@ final class SettingsStore: ObservableObject {
         appPromptBindings: [AppPromptBinding]
     ) {
         self.savedProviders = payload.savedProviders
+        if let bedrockRegion = payload.bedrockRegion {
+            self.bedrockRegion = bedrockRegion
+        }
         self.selectedProviderID = payload.selectedProviderID
         self.selectedModelByProvider = payload.selectedModelByProvider
         self.modelReasoningConfigs = payload.modelReasoningConfigs

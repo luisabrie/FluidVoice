@@ -45,7 +45,7 @@ extension AIEnhancementSettingsViewModel {
         let builtIn = !draft.providerID.isEmpty && ModelRepository.shared.isBuiltIn(draft.providerID)
         guard draft.providerID.isEmpty || builtIn else { return false }
         guard !builtIn || !self.cachedAddedProviderItems.contains(where: { $0.id == draft.providerID }) else { return false }
-        let models = draft.modelsToSave(defaults: builtIn ? ModelRepository.shared.defaultModels(for: draft.providerID) : [])
+        let models = draft.modelsToSave(defaults: builtIn ? ModelRepository.shared.defaultModels(for: draft.providerID, baseURL: draft.trimmedBaseURL) : [])
         let provider = SettingsStore.SavedProvider(name: draft.trimmedName, baseURL: draft.trimmedBaseURL, models: models)
         let id = builtIn ? draft.providerID : provider.id
         let key = self.providerKey(for: id)
@@ -58,6 +58,11 @@ extension AIEnhancementSettingsViewModel {
                 self.refreshProviderItems()
                 return false
             }
+        }
+        // Bedrock is built in, so its endpoint is saved as a region.
+        if draft.providerID == AmazonBedrock.providerID, let region = AmazonBedrock.region(fromBaseURL: draft.trimmedBaseURL) {
+            self.settings.bedrockRegion = region
+            self.bedrockRegion = region
         }
         if !builtIn { self.savedProviders.append(provider) }
         self.availableModelsByProvider[key] = models

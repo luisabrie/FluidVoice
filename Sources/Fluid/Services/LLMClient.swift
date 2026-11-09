@@ -80,6 +80,8 @@ final nonisolated class LLMClient: @unchecked Sendable {
     /// Learns which models reject `temperature` so later requests stop sending it.
     private let temperatureSupport: ModelTemperatureSupport
 
+    private let awsCredentials: AWSCLICredentialProvider
+
     private init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.defaultTimeoutSeconds
@@ -87,17 +89,20 @@ final nonisolated class LLMClient: @unchecked Sendable {
         self.session = URLSession(configuration: config)
         self.temperatureSupport = .shared
         self.idleConnectionLimit = Self.idleConnectionLimit
+        self.awsCredentials = .shared
     }
 
     /// Test seam for deterministic transport fixtures; callers own the session configuration.
     init(
         session: URLSession,
         temperatureSupport: ModelTemperatureSupport = .shared,
-        idleConnectionLimit: TimeInterval = LLMClient.idleConnectionLimit
+        idleConnectionLimit: TimeInterval = LLMClient.idleConnectionLimit,
+        awsCredentials: AWSCLICredentialProvider = .shared
     ) {
         self.session = session
         self.temperatureSupport = temperatureSupport
         self.idleConnectionLimit = idleConnectionLimit
+        self.awsCredentials = awsCredentials
     }
 
     // MARK: - Response Types
@@ -137,6 +142,12 @@ final nonisolated class LLMClient: @unchecked Sendable {
         var arguments: String = ""
     }
 
+    private struct ConverseToolUseAccumulator {
+        var id: String
+        var name: String
+        var inputJSON = ""
+    }
+
     // MARK: - Configuration
 
     struct Config: @unchecked Sendable {
@@ -144,7 +155,7 @@ final nonisolated class LLMClient: @unchecked Sendable {
         let model: String
         let baseURL: String
         let apiKey: String
-        let streaming: Bool
+        var streaming: Bool
         let tools: [[String: Any]]
         var temperature: Double?
 
@@ -204,7 +215,7 @@ final nonisolated class LLMClient: @unchecked Sendable {
     /// Handles thinking token extraction, tool call parsing, and retries.
     @concurrent func call(_ config: Config) async throws -> Response {
         self.benchmark(config, "call_enter")
-        var request = try buildRequest(config)
+        var request = try await self.prepareRequest(config)
         self.benchmark(config, "request_built bodyBytes=\(request.httpBody?.count ?? 0)")
 
         // Apply timeout to the request itself
@@ -230,10 +241,53 @@ final nonisolated class LLMClient: @unchecked Sendable {
             var retryConfig = config
             retryConfig.temperature = nil
             return try await self.call(retryConfig)
+        } catch let LLMError.httpError(400, body)
+            where config.streaming && !config.tools.isEmpty && body.lowercased().contains("tool use in streaming mode")
+        {
+            // Some Bedrock models (Llama, for one) take tools only without streaming. This 400 also
+            // arrives before any output, so the retry cannot duplicate text.
+            DebugLogger.shared.warning("LLMClient: \(config.model) can't stream tool use; retrying without streaming", source: "LLMClient")
+            var retryConfig = config
+            retryConfig.streaming = false
+            return try await self.call(retryConfig)
         } catch {
             self.benchmark(config, "call_fail")
+            // Credentials revoked or expired before the cached expiry: export fresh ones next time.
+            if case let LLMError.httpError(status, body) = error, AmazonBedrock.rejectsCredentials(status: status, body: body),
+               let profile = Self.bedrockProfile(for: config)
+            {
+                await self.awsCredentials.invalidate(profile: profile)
+            }
             throw error
         }
+    }
+
+    /// Builds the request and, for Amazon Bedrock with an AWS profile, signs it with SigV4.
+    func prepareRequest(_ config: Config) async throws -> URLRequest {
+        var config = config
+        if AmazonBedrock.isConverseEndpoint(baseURL: config.baseURL) {
+            config.extraParameters = await Self.converseExtraParameters(for: config)
+        }
+        let request = try self.buildRequest(config)
+        guard let profile = Self.bedrockProfile(for: config) else { return request }
+        return try await self.signedBedrockRequest(request, profile: profile)
+    }
+
+    func signedBedrockRequest(_ request: URLRequest, profile: String) async throws -> URLRequest {
+        guard let url = request.url, let region = AmazonBedrock.region(fromBaseURL: url.absoluteString) else {
+            throw LLMError.invalidURL
+        }
+
+        let credentials: AWSCredentials
+        do {
+            credentials = try await self.awsCredentials.credentials(profile: profile)
+        } catch let error as AWSCLIError {
+            throw LLMError.invalidRequest(error.localizedDescription)
+        }
+
+        var signed = request
+        AWSSigV4.sign(&signed, credentials: credentials, region: region, service: "bedrock")
+        return signed
     }
 
     /// Execute request with retry logic (extracted for timeout wrapper)
@@ -245,6 +299,9 @@ final nonisolated class LLMClient: @unchecked Sendable {
             do {
                 self.benchmark(config, "attempt_start attempt=\(attempt)")
                 if config.streaming {
+                    if Self.isConverseRequest(request) {
+                        return try await self.processConverseStreaming(request: request, config: config, session: session)
+                    }
                     if self.isResponsesRequest(request) {
                         return try await self.processResponsesStreaming(request: request, config: config, session: session)
                     }
@@ -305,6 +362,10 @@ final nonisolated class LLMClient: @unchecked Sendable {
         guard !baseURL.isEmpty else {
             DebugLogger.shared.error("LLMClient: Missing base URL; refusing to fall back to OpenAI", source: "LLMClient")
             throw LLMError.invalidURL
+        }
+
+        if AmazonBedrock.isConverseEndpoint(baseURL: baseURL) {
+            return try self.buildConverseRequest(config, baseURL: baseURL)
         }
 
         let useResponsesAPI = Self.shouldUseResponsesAPI(baseURL: baseURL, model: config.model)
@@ -573,7 +634,9 @@ final nonisolated class LLMClient: @unchecked Sendable {
         }
 
         var parsed: Response
-        if self.isResponsesRequest(request) {
+        if Self.isConverseRequest(request) {
+            parsed = try self.parseConverseResponse(json)
+        } else if self.isResponsesRequest(request) {
             parsed = try self.parseResponsesResponse(json)
             let status = json["status"] as? String
             let output = json["output"] as? [[String: Any]] ?? []
@@ -702,6 +765,115 @@ final nonisolated class LLMClient: @unchecked Sendable {
             content: contentBuffer.joined().trimmingCharacters(in: .whitespacesAndNewlines),
             toolCalls: toolCalls
         )
+        self.benchmark(config, "response_decoded")
+        return parsed
+    }
+
+    private func processConverseStreaming(request: URLRequest, config: Config, session: URLSession) async throws -> Response {
+        DebugLogger.shared.debug("LLMClient: Starting Converse streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
+
+        let (bytes, response) = try await session.bytes(for: request)
+        self.benchmark(config, "response_headers")
+
+        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+            var errorData = Data()
+            for try await byte in bytes {
+                errorData.append(byte)
+            }
+            throw LLMError.httpError(http.statusCode, String(data: errorData, encoding: .utf8) ?? "Unknown error")
+        }
+
+        var decoder = AWSEventStreamDecoder()
+        var contentBuffer: [String] = []
+        var thinkingBuffer: [String] = []
+        var toolUses: [Int: ConverseToolUseAccumulator] = [:]
+        var isThinking = false
+        var didLogFirstContent = false
+        var stopReason: String?
+
+        func endThinking() {
+            guard isThinking else { return }
+            isThinking = false
+            config.onThinkingEnd?()
+        }
+
+        for try await byte in bytes {
+            guard let message = try decoder.append(byte) else { continue }
+            if message.headers[":message-type"] == "exception" {
+                // Errors after the 200 response arrive as exception events, such as throttlingException.
+                let statusCode = switch message.headers[":exception-type"] {
+                case "throttlingException": 429
+                case "serviceUnavailableException": 503
+                case "internalServerException", "modelStreamErrorException": 500
+                default: 400
+                }
+                throw LLMError.httpError(statusCode, String(data: message.payload, encoding: .utf8) ?? "")
+            }
+            if message.headers[":message-type"] == "error" {
+                // Event-stream protocol errors carry their details in headers.
+                throw LLMError.httpError(500, "\(message.headers[":error-code"] ?? "error"): \(message.headers[":error-message"] ?? "")")
+            }
+            guard let event = try? JSONSerialization.jsonObject(with: message.payload) as? [String: Any] else { continue }
+
+            let index = event["contentBlockIndex"] as? Int ?? 0
+            switch message.headers[":event-type"] {
+            case "contentBlockStart":
+                guard let toolUse = (event["start"] as? [String: Any])?["toolUse"] as? [String: Any] else { continue }
+                endThinking()
+                let name = toolUse["name"] as? String ?? ""
+                toolUses[index] = ConverseToolUseAccumulator(
+                    id: toolUse["toolUseId"] as? String ?? "call_\(UUID().uuidString.prefix(8))",
+                    name: name
+                )
+                if !name.isEmpty {
+                    config.onToolCallStart?(name)
+                }
+            case "contentBlockDelta":
+                guard let delta = event["delta"] as? [String: Any] else { continue }
+                if let text = delta["text"] as? String, !text.isEmpty {
+                    endThinking()
+                    if !didLogFirstContent {
+                        didLogFirstContent = true
+                        self.benchmark(config, "first_content")
+                    }
+                    contentBuffer.append(text)
+                    config.onContentChunk?(text)
+                } else if let thinking = (delta["reasoningContent"] as? [String: Any])?["text"] as? String, !thinking.isEmpty {
+                    if !isThinking {
+                        isThinking = true
+                        config.onThinkingStart?()
+                    }
+                    thinkingBuffer.append(thinking)
+                    config.onThinkingChunk?(thinking)
+                } else if let input = (delta["toolUse"] as? [String: Any])?["input"] as? String {
+                    toolUses[index]?.inputJSON += input
+                }
+            case "messageStop":
+                stopReason = event["stopReason"] as? String
+            default:
+                continue
+            }
+        }
+        endThinking()
+
+        let toolCalls = toolUses.keys.sorted().compactMap { index -> ToolCall? in
+            guard let toolUse = toolUses[index], !toolUse.name.isEmpty else { return nil }
+            let json = toolUse.inputJSON.trimmingCharacters(in: .whitespaces)
+            guard !json.isEmpty else { return ToolCall(id: toolUse.id, name: toolUse.name, arguments: [:]) }
+            guard let data = json.data(using: .utf8),
+                  let arguments = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return nil }
+            return ToolCall(id: toolUse.id, name: toolUse.name, arguments: arguments)
+        }
+
+        let thinking = thinkingBuffer.joined()
+        var parsed = Response(
+            thinking: thinking.isEmpty ? nil : thinking,
+            content: contentBuffer.joined().trimmingCharacters(in: .whitespacesAndNewlines),
+            toolCalls: toolCalls
+        )
+        // A stream that closes before `messageStop` was cut off.
+        parsed.isIncomplete = stopReason == nil || Self.isIncompleteConverseStopReason(stopReason)
         self.benchmark(config, "response_decoded")
         return parsed
     }

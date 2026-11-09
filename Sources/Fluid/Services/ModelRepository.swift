@@ -17,7 +17,7 @@ final class ModelRepository {
     /// All built-in provider IDs (not including custom/saved providers)
     static var builtInProviderIDs: [String] {
         var providers = [
-            "openai", "anthropic", "xai", "groq", "cerebras", "google", "openrouter", "ollama", "lmstudio",
+            "openai", "anthropic", AmazonBedrock.providerID, "xai", "groq", "cerebras", "google", "openrouter", "ollama", "lmstudio",
         ]
         if PrivateFeatures.privateAIProvider {
             providers.insert(PrivateAIProviderFeature.shared.providerID, at: 0)
@@ -37,6 +37,8 @@ final class ModelRepository {
             return ["gpt-4.1"]
         case "anthropic":
             return ["claude-sonnet-4-20250514"]
+        case AmazonBedrock.providerID:
+            return Self.bedrockModels(region: SettingsStore.savedBedrockRegion)
         case "xai":
             return ["grok-3-fast"]
         case "groq":
@@ -65,6 +67,14 @@ final class ModelRepository {
         return self.defaultModels(for: providerID)
     }
 
+    /// Defaults for a provider at a specific endpoint; Bedrock's model IDs follow the endpoint's region.
+    func defaultModels(for providerID: String, baseURL: String) -> [String] {
+        if providerID == AmazonBedrock.providerID, let region = AmazonBedrock.region(fromBaseURL: baseURL) {
+            return Self.bedrockModels(region: region)
+        }
+        return self.defaultModels(for: providerID)
+    }
+
     static func eligibleModel(preferred: String?, from models: [String]) -> String? {
         if let preferred, models.contains(preferred) {
             return preferred
@@ -79,6 +89,8 @@ final class ModelRepository {
             return "https://api.openai.com/v1"
         case "anthropic":
             return "https://api.anthropic.com/v1"
+        case AmazonBedrock.providerID:
+            return Self.bedrockBaseURL(region: SettingsStore.savedBedrockRegion)
         case "xai":
             return "https://api.x.ai/v1"
         case "groq":
@@ -107,6 +119,7 @@ final class ModelRepository {
         switch providerID {
         case "openai": return "OpenAI"
         case "anthropic": return "Anthropic"
+        case AmazonBedrock.providerID: return AmazonBedrock.displayName
         case "xai": return "xAI"
         case "groq": return "Groq"
         case "cerebras": return "Cerebras"
@@ -116,6 +129,57 @@ final class ModelRepository {
         case "lmstudio": return "LM Studio"
         default: return providerID.capitalized
         }
+    }
+
+    // MARK: - Amazon Bedrock
+
+    /// Regions where Bedrock serves Claude.
+    static let bedrockRegions = [
+        "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1", "ca-west-1",
+        "eu-central-1", "eu-central-2", "eu-north-1", "eu-south-1", "eu-south-2", "eu-west-1", "eu-west-2", "eu-west-3",
+        "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-south-2",
+        "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
+        "af-south-1", "il-central-1", "me-central-1", "sa-east-1",
+    ]
+
+    static func bedrockBaseURL(region: String) -> String {
+        "https://bedrock-runtime.\(AmazonBedrock.normalizedRegion(region) ?? AmazonBedrock.defaultRegion).amazonaws.com"
+    }
+
+    /// Cross-Region inference profiles for the region's geography, until the account's profiles are loaded.
+    static func bedrockModels(region: String) -> [String] {
+        let prefix = self.bedrockInferenceProfilePrefix(forRegion: region)
+        return [
+            "\(prefix).anthropic.claude-opus-5-5",
+            "\(prefix).anthropic.claude-sonnet-5-5",
+            "\(prefix).anthropic.claude-haiku-5-5",
+            "\(prefix).anthropic.claude-haiku-4-5-20251001-v1:0",
+        ]
+    }
+
+    /// The same model in another region's list, whose inference profiles differ: a geography's profile first (it keeps
+    /// requests in that geography), then the global one, then the in-Region model.
+    static func bedrockModelID(_ modelID: String, among models: [String]) -> String? {
+        if models.contains(modelID) {
+            return modelID
+        }
+        let foundationModel = AmazonBedrock.foundationModelID(modelID)
+        let matches = models.filter { AmazonBedrock.foundationModelID($0) == foundationModel }
+        return matches.first { $0 != foundationModel && !$0.hasPrefix("global.") }
+            ?? matches.first { $0.hasPrefix("global.") }
+            ?? matches.first
+    }
+
+    /// Geography profiles exist per model (Claude Sonnet 5.5 has `us.`, `eu.`, and `au.` but no `jp.`), so the
+    /// defaults use only those every default model has, and global profiles elsewhere.
+    private static func bedrockInferenceProfilePrefix(forRegion region: String) -> String {
+        if region.hasPrefix("us-") {
+            return "us"
+        }
+        if region.hasPrefix("eu-") {
+            return "eu"
+        }
+        return ["ap-southeast-2", "ap-southeast-4"].contains(region) ? "au" : "global"
     }
 
     /// Check if a provider ID is a built-in provider
@@ -131,6 +195,8 @@ final class ModelRepository {
             return ("https://platform.openai.com/api-keys", "Get API Key")
         case "anthropic":
             return ("https://platform.claude.com/settings/keys", "Get API Key")
+        case AmazonBedrock.providerID:
+            return ("https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-generate.html", "Get API Key")
         case "xai":
             return ("https://console.x.ai/", "Get API Key")
         case "groq":
@@ -148,6 +214,14 @@ final class ModelRepository {
         default:
             return nil
         }
+    }
+
+    /// Bedrock signed in with an AWS profile links to the AWS CLI sign-in guide instead of API keys.
+    func providerWebsiteURL(for providerID: String, apiKey: String) -> (url: String, label: String)? {
+        if providerID == AmazonBedrock.providerID, BedrockCredential(storedValue: apiKey).usesProfile {
+            return ("https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html", "Setup Guide")
+        }
+        return self.providerWebsiteURL(for: providerID)
     }
 
     /// Check if a URL represents a local endpoint (localhost, local IP)
@@ -170,6 +244,7 @@ final class ModelRepository {
         var list: [(id: String, name: String)] = [
             ("openai", "OpenAI"),
             ("anthropic", "Anthropic"),
+            (AmazonBedrock.providerID, AmazonBedrock.displayName),
             ("xai", "xAI"),
             ("groq", "Groq"),
             ("cerebras", "Cerebras"),
@@ -247,6 +322,10 @@ final class ModelRepository {
     ) async throws -> [String] {
         if PrivateFeatures.privateAIProvider, providerID == PrivateAIProviderFeature.shared.providerID {
             return PrivateAIProviderFeature.shared.modelIDs()
+        }
+
+        if AmazonBedrock.isConverseEndpoint(baseURL: baseURL) {
+            return try await self.fetchBedrockModels(baseURL: baseURL, apiKey: apiKey ?? "")
         }
 
         let isAnthropic = providerID == "anthropic" || baseURL.contains("anthropic.com")
@@ -351,6 +430,30 @@ final class ModelRepository {
         throw FetchError.invalidResponse(details: "Unknown response format. Top-level keys: [\(topLevelKeys)]. Expected 'data' or 'models'.")
     }
 
+    /// Bedrock has no OpenAI-style model listing. List the account's Converse chat models instead, and
+    /// fall back to the suggested models when listing is not permitted.
+    private func fetchBedrockModels(baseURL: String, apiKey: String) async throws -> [String] {
+        let region = AmazonBedrock.region(fromBaseURL: baseURL) ?? AmazonBedrock.defaultRegion
+        do {
+            let models = try await BedrockModelCatalog.chatModelIDs(
+                region: region,
+                credential: BedrockCredential(storedValue: apiKey)
+            )
+            if !models.isEmpty {
+                return models
+            }
+        } catch let error as AWSCLIError {
+            // A fallback list would hide a sign-in the user has to fix.
+            throw FetchError.credentials(details: error.localizedDescription)
+        } catch {
+            DebugLogger.shared.warning(
+                "fetchModels: Bedrock inference profile listing failed; using suggested models: \(error.localizedDescription)",
+                source: "ModelRepository"
+            )
+        }
+        return Self.bedrockModels(region: region)
+    }
+
     private func rawHTTPErrorDetails(responseBody: String) -> String {
         let trimmed = responseBody.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "<empty response body>" : trimmed
@@ -382,6 +485,7 @@ final class ModelRepository {
         case httpError(statusCode: Int, details: String)
         case invalidResponse(details: String)
         case networkError(details: String)
+        case credentials(details: String)
 
         var errorDescription: String? {
             switch self {
@@ -393,6 +497,8 @@ final class ModelRepository {
                 return "Invalid response: \(details)"
             case let .networkError(details):
                 return "Network error: \(details)"
+            case let .credentials(details):
+                return "AWS sign-in error: \(details)"
             }
         }
     }

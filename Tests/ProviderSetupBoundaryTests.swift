@@ -17,8 +17,8 @@ struct PrivateAIProviderFeature {
 
 struct ModelRepository {
     static let shared = ModelRepository()
-    func isBuiltIn(_ id: String) -> Bool { ["openai", "ollama", "fluid"].contains(id) }
-    func defaultModels(for id: String) -> [String] { ["default-model"] }
+    func isBuiltIn(_ id: String) -> Bool { ["openai", "ollama", "fluid", "bedrock"].contains(id) }
+    func defaultModels(for id: String, baseURL: String) -> [String] { ["default-model"] }
 }
 
 final class SettingsStore {
@@ -45,6 +45,7 @@ final class SettingsStore {
     var selectedModelByProvider: [String: String] = [:]
     var dictationPromptConfigurations: [String: Configuration] = [:]
     var verifiedProviderFingerprints: [String: String] = [:]
+    var bedrockRegion = "us-east-1"
 }
 
 final class AIEnhancementSettingsViewModel {
@@ -65,6 +66,7 @@ final class AIEnhancementSettingsViewModel {
     var availableModelsByProvider: [String: [String]] = [:]
     var selectedModelByProvider: [String: String] = ["fluid": "mini"]
     var cachedAddedProviderItems: [ProviderItemData] = []
+    var bedrockRegion = "us-east-1"
     var failKeychain = false
     var saves = 0
     var keySaves = 0
@@ -193,6 +195,19 @@ final class AIEnhancementSettingsViewModel {
         check(vm.addProvider(builtIn), "Keyless local provider can be added")
         check(!vm.addProvider(builtIn), "Duplicate built-in Add is rejected")
         check(vm.cachedAddedProviderItems.contains { $0.id == "ollama" }, "Keyless provider remains visible via explicit membership")
+        var bedrock = ProviderSetupDraft(
+            providerID: "bedrock",
+            name: "Amazon Bedrock",
+            baseURL: "https://bedrock-runtime.eu-west-1.amazonaws.com",
+            apiKey: BedrockCredential.profile("").storedValue
+        )
+        check(!bedrock.isValid, "Bedrock needs a chosen AWS profile")
+        bedrock.apiKey = BedrockCredential.profile("dev-sso").storedValue
+        vm.failKeychain = true
+        check(!vm.addProvider(bedrock) && vm.settings.bedrockRegion == "us-east-1", "Keychain failure leaves the Bedrock region unchanged")
+        vm.failKeychain = false
+        check(vm.addProvider(bedrock) && vm.settings.bedrockRegion == "eu-west-1", "Adding Bedrock keeps the chosen AWS region")
+        check(vm.persistedKeys["bedrock"] == "aws-profile:dev-sso", "Bedrock stores the AWS profile reference in its credential slot")
         vm.providerAPIKeys["openai"] = "expired-key"
         vm.refreshProviderItems()
         check(vm.cachedAddedProviderItems.contains { $0.id == "openai" }, "Unverified legacy credentials remain discoverable")

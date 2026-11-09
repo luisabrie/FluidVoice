@@ -54,7 +54,8 @@ struct AddProviderSheet<Logo: View>: View {
                                         self.draft = ProviderSetupDraft(
                                             providerID: provider.id,
                                             name: provider.name,
-                                            baseURL: ModelRepository.shared.defaultBaseURL(for: provider.id)
+                                            baseURL: ModelRepository.shared.defaultBaseURL(for: provider.id),
+                                            apiKey: provider.id == AmazonBedrock.providerID ? BedrockCredential.profile("").storedValue : ""
                                         )
                                         self.isEditing = true
                                     } label: {
@@ -62,7 +63,7 @@ struct AddProviderSheet<Logo: View>: View {
                                             self.logo(provider.id, provider.name).accessibilityHidden(true)
                                             VStack(alignment: .leading, spacing: 5) {
                                                 Text(provider.name).font(self.theme.typography.bodyStrong)
-                                                Text(["ollama", "lmstudio"].contains(provider.id) ? "Local connection" : "Connect with an API key")
+                                                Text(self.connectionSummary(for: provider.id))
                                                     .font(self.theme.typography.caption).foregroundStyle(self.theme.palette.secondaryText)
                                             }
                                             Spacer()
@@ -105,7 +106,10 @@ struct AddProviderSheet<Logo: View>: View {
             self.cancelModelFetch()
             self.modelFetchError = nil
         }
-        .onDisappear { self.cancelModelFetch() }
+        .onDisappear {
+            self.cancelModelFetch()
+            self.viewModel.cancelAWSSignIn()
+        }
     }
 
     private var form: some View {
@@ -117,10 +121,21 @@ struct AddProviderSheet<Logo: View>: View {
                             self.field("Name") { TextField("Custom Provider", text: self.$draft.name) }
                             self.field("Server URL") { TextField("https://your-server.com/v1", text: self.$draft.baseURL) }
                         }
-                        self.field(self.draft.requiresAPIKey ? "API key" : "API key · Optional") {
-                            SecureField("Enter API key", text: self.$draft.apiKey)
+                        if self.draft.providerID == AmazonBedrock.providerID {
+                            BedrockConnectionFields(viewModel: self.viewModel, credential: self.$draft.apiKey, region: self.bedrockRegion) { title, control in
+                                self.field(title) { control }
+                            }
+                            if let message = self.viewModel.awsSignInError(for: self.draft.apiKey) {
+                                Text(message).font(self.theme.typography.caption).foregroundStyle(.red)
+                                    .textSelection(.enabled)
+                            }
                         }
-                        if let website = ModelRepository.shared.providerWebsiteURL(for: self.draft.providerID), let url = URL(string: website.url) {
+                        if AmazonBedrock.showsAPIKeyField(providerID: self.draft.providerID, credential: self.draft.apiKey) {
+                            self.field(self.draft.requiresAPIKey ? "API key" : "API key · Optional") {
+                                SecureField("Enter API key", text: self.$draft.apiKey)
+                            }
+                        }
+                        if let website = ModelRepository.shared.providerWebsiteURL(for: self.draft.providerID, apiKey: self.draft.apiKey), let url = URL(string: website.url) {
                             Link(destination: url) { Label(website.label, systemImage: "arrow.up.right").font(self.theme.typography.caption) }
                         }
                     }
@@ -191,6 +206,22 @@ struct AddProviderSheet<Logo: View>: View {
                 Text(error).font(self.theme.typography.caption).foregroundStyle(.red)
                     .textSelection(.enabled)
             }
+        }
+    }
+
+    /// Bedrock's endpoint follows its region; the draft keeps the resulting base URL.
+    private var bedrockRegion: Binding<String> {
+        Binding(
+            get: { AmazonBedrock.region(fromBaseURL: self.draft.baseURL) ?? AmazonBedrock.defaultRegion },
+            set: { self.draft.baseURL = ModelRepository.bedrockBaseURL(region: $0) }
+        )
+    }
+
+    private func connectionSummary(for providerID: String) -> String {
+        switch providerID {
+        case "ollama", "lmstudio": return "Local connection"
+        case AmazonBedrock.providerID: return "Connect with your AWS account"
+        default: return "Connect with an API key"
         }
     }
 

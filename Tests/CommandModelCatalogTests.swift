@@ -36,6 +36,8 @@ enum PrivateAIModelRegistry {
 }
 
 final class SettingsStore: ObservableObject {
+    static let savedBedrockRegion = "us-east-1"
+
     struct SavedProvider: Equatable {
         let id: String
         let name: String

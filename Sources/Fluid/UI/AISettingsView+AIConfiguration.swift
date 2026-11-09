@@ -1157,49 +1157,40 @@ extension AIEnhancementSettingsView {
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("API Key")
-                        .font(.fluidSystem(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    HStack(alignment: .center, spacing: 8) {
-                        SecureField("Enter API key", text: apiKeyBinding)
-                            .textFieldStyle(.plain)
-                            .font(.fluidSystem(size: 13))
-                            .padding(.horizontal, managementLayout ? 12 : 6)
-                            .frame(height: AISettingsLayout.providerRowControlHeight)
-                            .frame(maxWidth: managementLayout ? .infinity : 200)
-                            .background(self.theme.palette.cardBackground, in: RoundedRectangle(cornerRadius: self.theme.metrics.corners.sm))
-                            .overlay(RoundedRectangle(cornerRadius: self.theme.metrics.corners.sm).strokeBorder(self.theme.palette.cardBorder))
-                            .onTapGesture {
-                                self.viewModel.ensureKeychainAccessForAPIKeyEdit()
-                            }
-                        if let websiteInfo = ModelRepository.shared.providerWebsiteURL(for: item.id),
-                           let url = URL(string: websiteInfo.url)
-                        {
-                            if managementLayout {
-                                Button(websiteInfo.label, systemImage: "key") { NSWorkspace.shared.open(url) }
-                                    .buttonStyle(.plain)
-                                    .font(self.theme.typography.bodyStrong)
-                                    .foregroundStyle(self.theme.palette.accent)
-                                    .frame(width: 128, height: AISettingsLayout.providerRowControlHeight)
-                            } else {
-                                Button(action: { NSWorkspace.shared.open(url) }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: websiteInfo.label.contains("Guide") ? "book.fill" : "key.fill")
-                                            .font(.fluidSystem(size: 10))
-                                        Text(websiteInfo.label)
-                                            .font(.fluidSystem(size: 11, weight: .medium))
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                            .fill(self.theme.palette.accent)
-                                    )
-                                    .foregroundStyle(.white)
+                if item.id == AmazonBedrock.providerID {
+                    BedrockConnectionFields(
+                        viewModel: self.viewModel,
+                        credential: apiKeyBinding,
+                        region: Binding(
+                            get: { self.viewModel.bedrockRegion },
+                            set: { self.viewModel.updateBedrockRegion($0) }
+                        ),
+                        controlWidth: managementLayout ? nil : 200,
+                        signInAccessory: AnyView(self.providerWebsiteButton(for: item.id, apiKey: apiKeyValue, managementLayout: managementLayout)),
+                        field: self.providerField
+                    )
+                    if let message = self.viewModel.awsSignInError(for: apiKeyValue) {
+                        self.providerErrorPreview(message, lineLimit: 4)
+                    }
+                }
+                if AmazonBedrock.showsAPIKeyField(providerID: item.id, credential: apiKeyValue) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("API Key")
+                            .font(.fluidSystem(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        HStack(alignment: .center, spacing: 8) {
+                            SecureField("Enter API key", text: apiKeyBinding)
+                                .textFieldStyle(.plain)
+                                .font(.fluidSystem(size: 13))
+                                .padding(.horizontal, managementLayout ? 12 : 6)
+                                .frame(height: AISettingsLayout.providerRowControlHeight)
+                                .frame(maxWidth: managementLayout ? .infinity : 200)
+                                .background(self.theme.palette.cardBackground, in: RoundedRectangle(cornerRadius: self.theme.metrics.corners.sm))
+                                .overlay(RoundedRectangle(cornerRadius: self.theme.metrics.corners.sm).strokeBorder(self.theme.palette.cardBorder))
+                                .onTapGesture {
+                                    self.viewModel.ensureKeychainAccessForAPIKeyEdit()
                                 }
-                                .buttonStyle(.plain)
-                            }
+                            self.providerWebsiteButton(for: item.id, apiKey: apiKeyValue, managementLayout: managementLayout)
                         }
                     }
                 }
@@ -1703,6 +1694,48 @@ extension AIEnhancementSettingsView {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
+    /// A labelled row in the same style as API Key and Model.
+    private func providerField(_ title: String, _ control: AnyView) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.fluidSystem(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+            control
+        }
+    }
+
+    @ViewBuilder
+    private func providerWebsiteButton(for providerID: String, apiKey: String, managementLayout: Bool) -> some View {
+        if let websiteInfo = ModelRepository.shared.providerWebsiteURL(for: providerID, apiKey: apiKey),
+           let url = URL(string: websiteInfo.url)
+        {
+            if managementLayout {
+                Button(websiteInfo.label, systemImage: "key") { NSWorkspace.shared.open(url) }
+                    .buttonStyle(.plain)
+                    .font(self.theme.typography.bodyStrong)
+                    .foregroundStyle(self.theme.palette.accent)
+                    .frame(width: 128, height: AISettingsLayout.providerRowControlHeight)
+            } else {
+                Button(action: { NSWorkspace.shared.open(url) }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: websiteInfo.label.contains("Guide") ? "book.fill" : "key.fill")
+                            .font(.fluidSystem(size: 10))
+                        Text(websiteInfo.label)
+                            .font(.fluidSystem(size: 11, weight: .medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(self.theme.palette.accent)
+                    )
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
     private func providerBackgroundColor(for item: ProviderItem) -> Color {
         let id = item.id.lowercased()
         let name = item.name.lowercased()
@@ -1712,6 +1745,9 @@ extension AIEnhancementSettingsView {
         }
         if id.contains("anthropic") || name.contains("anthropic") {
             return Color(red: 0.85, green: 0.75, blue: 0.62) // Warm tan
+        }
+        if id.contains("bedrock") || name.contains("bedrock") {
+            return Color(red: 0.0, green: 0.66, blue: 0.55) // Bedrock teal
         }
         if id.contains("openai") || name.contains("openai") {
             return Color(red: 0.95, green: 0.95, blue: 0.95) // Light gray
@@ -1759,6 +1795,9 @@ extension AIEnhancementSettingsView {
         }
         if id.contains("anthropic") || name.contains("anthropic") {
             return "Provider_Anthropic"
+        }
+        if id.contains("bedrock") || name.contains("bedrock") {
+            return "Provider_Bedrock"
         }
         if id.contains("openrouter") || name.contains("openrouter") {
             return "Provider_OpenRouter"
@@ -2156,42 +2195,41 @@ extension AIEnhancementSettingsView {
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "key")
-                            .font(.fluidSystem(.caption))
-                            .foregroundStyle(.secondary)
-                        Text("API Key")
-                            .font(.fluidSystem(size: 12, weight: .medium))
-                            .foregroundStyle(.secondary)
+                if self.viewModel.selectedProviderID == AmazonBedrock.providerID {
+                    BedrockConnectionFields(
+                        viewModel: self.viewModel,
+                        credential: apiKeyBinding,
+                        region: Binding(
+                            get: { AmazonBedrock.region(fromBaseURL: self.viewModel.editProviderBaseURL) ?? AmazonBedrock.defaultRegion },
+                            set: { self.viewModel.editProviderBaseURL = ModelRepository.bedrockBaseURL(region: $0) }
+                        ),
+                        controlWidth: 200,
+                        signInAccessory: AnyView(self.providerWebsiteButton(for: AmazonBedrock.providerID, apiKey: self.viewModel.editProviderApiKey, managementLayout: false)),
+                        field: self.providerField
+                    )
+                    if let message = self.viewModel.awsSignInError(for: self.viewModel.editProviderApiKey) {
+                        self.providerErrorPreview(message, lineLimit: 4)
                     }
-                    HStack(alignment: .center, spacing: 8) {
-                        SecureField("Enter API key", text: apiKeyBinding)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.fluidSystem(size: 13))
-                            .frame(maxWidth: 200)
-                            .onTapGesture {
-                                self.viewModel.ensureKeychainAccessForAPIKeyEdit()
-                            }
-                        if let websiteInfo = ModelRepository.shared.providerWebsiteURL(for: self.viewModel.selectedProviderID),
-                           let url = URL(string: websiteInfo.url)
-                        {
-                            Button(action: { NSWorkspace.shared.open(url) }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: websiteInfo.label.contains("Guide") ? "book.fill" : "key.fill")
-                                        .font(.fluidSystem(size: 10))
-                                    Text(websiteInfo.label)
-                                        .font(.fluidSystem(size: 11, weight: .medium))
+                }
+                if AmazonBedrock.showsAPIKeyField(providerID: self.viewModel.selectedProviderID, credential: self.viewModel.editProviderApiKey) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "key")
+                                .font(.fluidSystem(.caption))
+                                .foregroundStyle(.secondary)
+                            Text("API Key")
+                                .font(.fluidSystem(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        HStack(alignment: .center, spacing: 8) {
+                            SecureField("Enter API key", text: apiKeyBinding)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.fluidSystem(size: 13))
+                                .frame(maxWidth: 200)
+                                .onTapGesture {
+                                    self.viewModel.ensureKeychainAccessForAPIKeyEdit()
                                 }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(self.theme.palette.accent)
-                                )
-                                .foregroundStyle(.white)
-                            }
-                            .buttonStyle(.plain)
+                            self.providerWebsiteButton(for: self.viewModel.selectedProviderID, apiKey: self.viewModel.editProviderApiKey, managementLayout: false)
                         }
                     }
                 }

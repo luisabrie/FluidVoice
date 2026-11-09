@@ -70,8 +70,15 @@ struct ProviderSetupDraft {
     var trimmedModel: String { self.model.trimmingCharacters(in: .whitespacesAndNewlines) }
     var trimmedBaseURL: String { self.baseURL.trimmingCharacters(in: .whitespacesAndNewlines) }
     var requiresAPIKey: Bool { !self.providerID.isEmpty && !["ollama", "lmstudio"].contains(self.providerID) }
+    /// Bedrock's AWS sign-in needs a profile name rather than a key.
+    private var hasCredential: Bool {
+        guard self.providerID == AmazonBedrock.providerID else {
+            return !self.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return BedrockCredential(storedValue: self.apiKey).isComplete
+    }
     var isValid: Bool {
-        guard !self.requiresAPIKey || !self.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !self.requiresAPIKey || self.hasCredential else { return false }
         guard !self.trimmedName.isEmpty, let url = URL(string: self.trimmedBaseURL),
               let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
               let host = url.host, !host.isEmpty,

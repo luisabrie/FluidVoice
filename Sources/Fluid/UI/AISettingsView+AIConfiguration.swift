@@ -1279,7 +1279,7 @@ extension AIEnhancementSettingsView {
                     self.providerErrorPreview(self.viewModel.connectionErrorMessage(for: item.id), lineLimit: 8)
                 }
 
-                if let error = self.viewModel.fetchModelsError, !error.isEmpty {
+                if self.viewModel.fetchModelsErrorProviderID == item.id, let error = self.viewModel.fetchModelsError, !error.isEmpty {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.fluidSystem(.caption))

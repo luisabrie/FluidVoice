@@ -38,6 +38,8 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
     @Published var isFetchingModels: Bool = false
     @Published var refreshingProviderID: String? = nil
     @Published var fetchModelsError: String? = nil
+    /// The provider `fetchModelsError` belongs to, so it is shown only in that provider's row.
+    @Published var fetchModelsErrorProviderID: String? = nil
 
     // Reasoning Configuration
     @Published var showingReasoningConfig: Bool = false
@@ -1255,6 +1257,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         self.refreshingProviderID = self.selectedProviderID
         self.isFetchingModels = true
         self.fetchModelsError = nil
+        self.fetchModelsErrorProviderID = self.selectedProviderID
         defer {
             self.isFetchingModels = false
             self.refreshingProviderID = nil
@@ -1365,6 +1368,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         self.refreshingProviderID = providerID
         self.isFetchingModels = true
         self.fetchModelsError = nil
+        self.fetchModelsErrorProviderID = providerID
         defer {
             self.isFetchingModels = false
             self.refreshingProviderID = nil
